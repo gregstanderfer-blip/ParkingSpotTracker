@@ -1,0 +1,16 @@
+# Secrets and saved Blink credentials
+.env
+data/
+
+# Model weights (downloaded on first run)
+*.pt
+
+# Generated config (contains your camera name + spot layout; regenerate locally)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
