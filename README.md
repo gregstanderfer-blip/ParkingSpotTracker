@@ -1,98 +1,119 @@
-# ParkingSpotTracker
+# Parking Spot Monitor (Tapo C120 → Mac → iMessage)
 
-Watches the parking spots outside via a **Blink camera** and sends you an
-**iMessage** the moment a spot opens up.
+Watches one or more parking spots on a TP-Link Tapo camera's video feed and
+texts you the moment a spot changes between **occupied** and **empty**. It uses
+on-device AI car detection (YOLOv8), so it ignores people, shadows, and pets,
+and it runs entirely on your Mac — no cloud service in the loop.
 
-It works by periodically grabbing a snapshot from the camera, running a YOLO
-object-detection model to find vehicles, and checking whether each parking spot
-you've marked is covered by a car. When a spot goes from occupied → empty, it
-texts you through the macOS Messages app.
+Every state change is logged, snapshotted, and saved as a short video clip so
+you have a record of when vehicles come and go.
 
-> **How Blink works:** Blink cameras are battery-powered and motion-triggered —
-> they don't stream continuously. This tool asks the camera to take a fresh photo
-> each polling cycle. Frequent polling drains the battery faster, so pick an
-> interval that balances responsiveness against battery life (60s is a sensible
-> start; consider 2–5 min for battery cameras).
+## How it works
+
+- A threaded RTSP reader pulls the live stream from the camera and always serves
+  the most recent frame (auto-reconnecting through glitches).
+- Each frame is downscaled to `PROC_WIDTH` and run through **YOLOv8x** to find
+  vehicles (car / motorcycle / bus / truck), on the Apple GPU (MPS) when present.
+- A spot is **occupied** if a detected vehicle's box sits inside the polygon you
+  drew for it. A new state must hold for `CONFIRM_SECONDS` before it's committed
+  (hysteresis filters out cars driving past).
+- On a committed change it: logs to `events.csv`, saves an annotated image to
+  `snapshots/`, saves a ~`CLIP_SECONDS` video to `clips/`, and sends an iMessage.
 
 ## Requirements
 
-- macOS (alerts use the built-in **Messages** app via AppleScript)
+- macOS (alerts go through the built-in **Messages** app; signed into iMessage)
 - Python 3.10+
-- A Blink camera with a clear view of the spots
-- You must be signed into iMessage in the Messages app
+- A Tapo (or any RTSP/ONVIF) camera with a clear view of the spots
+- ~150 MB disk for the model (downloads automatically on first run)
 
-## Setup
+## One-time setup
 
+### 1. Enable RTSP / make a local Camera Account
+In the **Tapo app**: camera → **Settings → Advanced Settings → Camera Account**.
+Create a **username + password** here. This is a *local* credential, separate
+from your tplinkcloud.com login — RTSP only works with this one.
+
+### 2. Give the camera a fixed IP
+Find the camera's IP (Tapo app → Settings → Device Info) and set a **DHCP
+reservation** for it in your router so it never changes.
+
+### 3. Configure
 ```bash
-cd ParkingSpotTracker
+cp config.example.py config.py
+```
+Edit `config.py`:
+- `RTSP_URL` → `rtsp://USERNAME:PASSWORD@CAMERA_IP:554/stream1`
+- `IMESSAGE_TO` → your phone number or iMessage email
 
-# 1. Install dependencies (a virtualenv is recommended)
+> Tip: test the URL in **VLC** (File → Open Network Stream) first.
+
+### 4. Install dependencies
+```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2. Configure secrets
-cp .env.example .env
-#    → edit .env: Blink login + the phone/Apple ID to alert
-
-# 3. Log in to Blink once (handles the 2FA code)
-python auth.py
-
-# 4. Mark your parking spots on a live snapshot
-python calibrate.py            # or: python calibrate.py "Camera Name"
-
-# 5. Start watching
-python run.py
+pip install -r requirements.txt        # ultralytics, opencv-python, numpy (+torch)
 ```
 
-The first run downloads the YOLO model weights (`yolov8n.pt`, ~6 MB) automatically.
+### 5. Allow Messages automation
+The first time it sends an alert, macOS asks to let your terminal control
+**Messages** — click **OK** (or pre-approve under System Settings → Privacy &
+Security → Automation).
 
-## How alerts work
+## Usage
 
-When a spot frees up you'll get an iMessage like:
+**Mark your spots (once, or whenever the camera moves):**
+```bash
+python select_spots.py
+```
+Click corner points around each spot, `n` for the next spot, `s` to save. This
+opens a GUI window, so run it on the Mac itself (not a headless shell).
 
-> 🅿️ Parking spot 'spot-1' just opened up!
+**Start watching:**
+```bash
+python monitor.py        # Ctrl-C to stop
+```
 
-The first time you run it, macOS will ask Terminal/your shell for permission to
-control Messages — allow it (System Settings → Privacy & Security → Automation).
+## What you get
 
-## Tuning (`config.json`)
+- **iMessage alert** on each state change (e.g. *"🅿️ Spot 1 just opened up!"* /
+  *"🚗 Spot 1 is now occupied."*). Text-only by default — see the note below.
+- **events.csv** — timestamped log of every occupied/empty change.
+- **snapshots/** — an annotated image at each change (red = occupied, green = empty).
+- **clips/** — a ~12-second video of each change so you can watch it happen.
 
-`calibrate.py` generates `config.json`. Adjust these to taste:
+> **About photos in texts:** sending image *attachments* via Messages/AppleScript
+> is unreliable on macOS Ventura+ (the file silently drops), so alerts are
+> text-only. The photo and clip are always saved locally in `snapshots/` and
+> `clips/`. Flip `ATTACH_PHOTO` in `config.py` to try attachments anyway.
 
-| Key | What it does |
+## Run it always-on (launchd)
+
+To auto-start at login and keep it running, use a LaunchAgent. A template is in
+[`launchd/`](launchd/). Edit the paths, then:
+```bash
+cp launchd/com.example.parkingspottracker.plist ~/Library/LaunchAgents/
+# edit the two absolute paths inside it to match your checkout
+launchctl load -w ~/Library/LaunchAgents/com.example.parkingspottracker.plist
+```
+It wraps the monitor in `caffeinate -i` so the Mac won't idle-sleep while
+watching, restarts it if it crashes, and logs to `monitor.log`.
+
+## Tuning (`config.py`)
+
+| Setting | What it does |
 | --- | --- |
-| `poll_interval_seconds` | How often to check (lower = faster alerts, more battery drain). |
-| `confidence_threshold` | Minimum YOLO confidence to count a detection as a vehicle. |
-| `overlap_threshold` | Fraction of a spot a car must cover to count as occupied (0–1). |
-| `debounce_frames` | Consecutive readings before a state change "sticks" (prevents false alerts from shadows/passers-by). |
-| `vehicle_classes` | Which detected object types count as vehicles. |
-
-Re-run `python calibrate.py` any time the camera moves or you want to re-mark spots.
-
-## Run it always-on (optional)
-
-`run.py` is a long-lived daemon. To keep it running across reboots/crashes, wrap
-it in a `launchd` agent (with `KeepAlive`) or run it under `tmux`/`screen`.
-
-## Project layout
-
-```
-auth.py          One-time Blink login (saves a token to data/)
-calibrate.py     Snapshot + draw boxes around spots → config.json
-run.py           Starts the watcher daemon
-parking_tracker/
-  config.py      Loads .env + config.json
-  blink_client.py  Snapshot capture via blinkpy
-  detector.py    YOLO vehicle detection + occupancy logic
-  notifier.py    Sends iMessages via osascript
-  state.py       Debounced per-spot occupancy state machine
-  tracker.py     Polling loop + alert dispatch
-```
+| `CONFIRM_SECONDS` | How long a change must hold before it counts (higher = fewer false alerts). |
+| `DETECT_INTERVAL_SECONDS` | How often it checks. |
+| `MIN_CONFIDENCE` | Min YOLO confidence for a vehicle. Raise if it sees phantom cars; lower if it misses them (e.g. at night). |
+| `MODEL` | `yolov8x.pt` here — smaller models couldn't detect the shadowed, oblique cars in this view. Try a smaller model if your angle is easier and you want it lighter. |
+| `PROC_WIDTH` | Detection/calibration width. Changing it means re-running `select_spots.py`. |
+| `ALERT_ON_BOTH` | Text on both transitions, or only when a spot frees up. |
+| `SAVE_CLIPS` / `CLIP_SECONDS` | Save a clip of each change and how long. |
 
 ## Notes & limitations
 
-- Uses the **unofficial** `blinkpy` library — there is no official public Blink API.
-- Detection accuracy depends on camera angle and lighting; tune `overlap_threshold`
-  and spot boxes if you see false positives/negatives.
-- Credentials (`.env`, `data/blink_creds.json`) and your local `config.json` are
+- Detection accuracy depends on camera angle and lighting; re-check at night and
+  tune `MIN_CONFIDENCE` / your spot polygons if needed.
+- The Mac must stay awake/running to monitor (the launchd setup handles this).
+- `config.py`, `spots.json`, `snapshots/`, `clips/`, and `events.csv` are
   git-ignored — they stay on your machine.

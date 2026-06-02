@@ -1,12 +1,22 @@
-# Secrets and saved Blink credentials
-.env
-data/
+# Camera credentials live in config.py — never commit it
+config.py
 
 # Model weights (downloaded on first run)
 *.pt
 
-# Generated config (contains your camera name + spot layout; regenerate locally)
-config.json
+# Generated at runtime
+snapshots/
+clips/
+events.csv
+monitor.log
+test.jpg
+latest.jpg
+
+# Your camera-specific spot calibration (run select_spots.py to create)
+spots.json
+
+# Local editor/agent settings
+.claude/settings.local.json
 
 # Python
 __pycache__/
