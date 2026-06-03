@@ -95,10 +95,13 @@ display (not over a headless/remote shell).
       (use `caffeinate -i` so the Mac doesn't sleep while monitoring).
 
 ## Tuning knobs (config.py)
-- `CONFIRM_SECONDS` — higher = fewer false alerts, slower to fire (currently 8).
+- `CONFIRM_SECONDS` — higher = fewer false alerts, slower to fire (currently 30,
+  raised from 8 to ride out low-light confidence dips on the dark Spot 1 car).
 - `DETECT_INTERVAL_SECONDS` — higher = lighter CPU (currently 2).
 - `MIN_CONFIDENCE` — raise if it sees phantom cars, lower if it misses them
-  (currently 0.30: above the dumpster's ~0.16, below the cars' 0.7+).
+  (currently 0.20: the shadowed SUV dips to ~0.29 at dusk; 0.20 keeps it detected
+  and is still above the dumpster's ~0.16, which sits outside both polygons).
+  NOTE: brightening / CLAHE was tested and made the dark car HARDER to detect.
 - `MODEL` — yolov8x.pt; smaller models miss the shadowed SUV here.
 - `PROC_WIDTH` — detection/calibration width (1280). Changing it means re-running
   `select_spots.py`, since saved polygon coordinates are in this resolution.
