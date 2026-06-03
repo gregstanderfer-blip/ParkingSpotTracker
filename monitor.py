@@ -225,6 +225,27 @@ def box_in_spot(box, poly_np):
     return False
 
 
+def detect_vehicle_boxes(model, frame, device=None, conf=None, imgsz=None):
+    """Run YOLO on a frame and return vehicle boxes [x1,y1,x2,y2] that clear the
+    confidence floor. Pure-ish wrapper so detection can be unit-tested on a saved
+    image. ``conf``/``imgsz`` default to the values in config."""
+    conf = config.MIN_CONFIDENCE if conf is None else conf
+    imgsz = config.PROC_WIDTH if imgsz is None else imgsz
+    res = model(frame, verbose=False, imgsz=imgsz, device=device)[0]
+    boxes = []
+    for b in res.boxes:
+        if int(b.cls[0]) in VEHICLE_CLASS_IDS and float(b.conf[0]) >= conf:
+            boxes.append(b.xyxy[0].tolist())
+    return boxes
+
+
+def spot_occupancy(boxes, spots):
+    """Map each spot name -> bool occupied, given vehicle boxes. Each spot needs
+    a ``polygon_np`` (np.int32 array)."""
+    return {s["name"]: any(box_in_spot(b, s["polygon_np"]) for b in boxes)
+            for s in spots}
+
+
 def log_event(spot_name, new_state):
     new_file = not os.path.exists(config.LOG_FILE)
     with open(config.LOG_FILE, "a", newline="") as f:
@@ -307,18 +328,12 @@ def main():
                 continue
             frame = resize_for_proc(frame)
 
-            results = model(frame, verbose=False, imgsz=config.PROC_WIDTH,
-                            device=device)[0]
-            boxes = []
-            for b in results.boxes:
-                cls = int(b.cls[0])
-                conf = float(b.conf[0])
-                if cls in VEHICLE_CLASS_IDS and conf >= config.MIN_CONFIDENCE:
-                    boxes.append(b.xyxy[0].tolist())
+            boxes = detect_vehicle_boxes(model, frame, device=device)
+            occ = spot_occupancy(boxes, spots)
 
             now = time.time()
             for s in spots:
-                raw = any(box_in_spot(box, s["polygon_np"]) for box in boxes)
+                raw = occ[s["name"]]
 
                 # confirm-with-hysteresis
                 if s["candidate"] != raw:

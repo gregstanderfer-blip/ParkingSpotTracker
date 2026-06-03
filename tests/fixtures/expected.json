@@ -1,0 +1,10 @@
+[
+  {
+    "label": "evening",
+    "image": "evening.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": true
+    }
+  }
+]

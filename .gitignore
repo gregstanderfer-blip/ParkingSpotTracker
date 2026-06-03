@@ -12,11 +12,17 @@ monitor.log
 test.jpg
 latest.jpg
 
-# Your camera-specific spot calibration (run select_spots.py to create)
-spots.json
+# Your camera-specific spot calibration (run select_spots.py to create).
+# Root-only — the committed tests/fixtures/spots.json must stay tracked.
+/spots.json
 
 # Local editor/agent settings
 .claude/settings.local.json
+
+# Test fixture images are real frames of the parking area — kept local, not
+# committed to the public repo. The manifest (expected.json) + polygons
+# (spots.json) under tests/fixtures/ ARE committed.
+tests/fixtures/*.jpg
 
 # Python
 __pycache__/
