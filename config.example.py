@@ -12,8 +12,8 @@ config.py is git-ignored because it holds your camera password.
 #
 #   rtsp://USERNAME:PASSWORD@CAMERA_IP:554/stream1
 #
-# stream1 = full 2K (sharp), stream2 = 640x360 (blurry). Detection downscales
-# stream1 to PROC_WIDTH; clips are recorded from stream2 (see below).
+# stream1 = full 2K (sharp). The monitor downscales it to PROC_WIDTH and polls a
+# single frame per check (it does NOT hold the stream open), so WiFi usage is tiny.
 RTSP_URL = "rtsp://USERNAME:PASSWORD@192.168.1.42:554/stream1"
 
 # ---- Alerts (Apple Messages) --------------------------------------------
@@ -22,9 +22,11 @@ RTSP_URL = "rtsp://USERNAME:PASSWORD@192.168.1.42:554/stream1"
 IMESSAGE_TO = "+15551234567"
 
 # ---- Detection tuning ----------------------------------------------------
-CONFIRM_SECONDS = 30           # a new state must hold continuously this long
-                               # before it counts (also rides out low-light dips)
-DETECT_INTERVAL_SECONDS = 2.0  # how often to run the detector
+CONFIRM_SECONDS = 30           # a new state must hold this long before it counts
+                               # (also rides out brief low-light detection dips)
+DETECT_INTERVAL_SECONDS = 15   # how often to poll (grab one frame + detect). Also
+                               # sets how little WiFi bandwidth is used. Cars take
+                               # >15s to move, so ~15s is plenty.
 MIN_CONFIDENCE = 0.25          # min YOLO confidence to count a vehicle (a bit low,
                                # so a dark/shadowed car isn't lost as it gets dim;
                                # CONFIRM_SECONDS re-checks before committing)
@@ -35,20 +37,10 @@ PROC_WIDTH = 1280              # detection/calibration width (must match between
 # ---- Files ---------------------------------------------------------------
 SPOTS_FILE = "spots.json"      # created by select_spots.py
 SNAPSHOT_DIR = "snapshots"     # annotated image saved on each state change
-CLIP_DIR = "clips"             # short video saved on each state change
 LOG_FILE = "events.csv"        # timestamped log of every transition
 SAVE_SNAPSHOTS = True
 
-# ---- Alerts & media on state change --------------------------------------
+# ---- Alerts on state change ----------------------------------------------
 # Text on BOTH transitions (freed AND newly occupied), or only when freed.
+# Alerts are text-only; the matching snapshot is saved to SNAPSHOT_DIR.
 ALERT_ON_BOTH = True
-# Attach the snapshot to the text. Off by default — Messages attachments via
-# AppleScript are unreliable on macOS Ventura+; the image is saved locally either
-# way. (Text alerts are reliable.)
-ATTACH_PHOTO = False
-# Save ~CLIP_SECONDS of video (a rolling buffer ending at detection) on each
-# change, so you can watch the transition. Recorded from the low-res stream2.
-SAVE_CLIPS = True
-CLIP_SECONDS = 12
-CLIP_FPS = 10
-CLIP_RTSP_URL = RTSP_URL.replace("/stream1", "/stream2")

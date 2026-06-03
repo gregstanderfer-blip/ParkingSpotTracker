@@ -34,22 +34,27 @@ Runs entirely **locally on the user's Mac mini** — no cloud service in the loo
 - `select_spots.py` — one-time calibration. Pulls a frame from the stream and
   lets the user click polygons around each parking spot; saves `spots.json`.
   Re-run whenever the camera physically moves.
-- `monitor.py` — the daemon. Threaded RTSP reader (always serves the latest
-  frame, auto-reconnects), downscales each frame to `PROC_WIDTH` (1280), runs
-  **YOLOv8x** to detect vehicles (COCO classes car/motorcycle/bus/truck) on the
-  Apple GPU (MPS) when available, decides occupied vs. empty per spot via
-  point-in-polygon test on the box center + bottom-center.
+- `monitor.py` — the daemon. **Polls** one frame per cycle via `grab_frame()`
+  (open RTSP → read a few frames → disconnect) every `DETECT_INTERVAL_SECONDS`;
+  it does NOT hold the stream open. Downscales to `PROC_WIDTH` (1280), runs
+  **YOLOv8x** (Apple GPU/MPS when available), decides occupied vs. empty per spot
+  via point-in-polygon on the box center + bottom-center. Detection lives in
+  `detect_vehicle_boxes()` / `spot_occupancy()` (extracted so tests can call them).
 - State machine per spot with hysteresis: a new state must hold for
-  `CONFIRM_SECONDS` before it's committed (filters out cars driving past).
-  On a committed occupied → empty transition it sends the iMessage. Every
-  committed change is appended to `events.csv` and saved as a snapshot in
-  `snapshots/`.
+  `CONFIRM_SECONDS` before it's committed. On a committed change it texts the
+  iMessage (both directions if `ALERT_ON_BOTH`), appends to `events.csv`, and
+  saves an annotated snapshot to `snapshots/YYYY/MM/DD/`.
 
 ## Key design decisions
 - Detection chosen over motion/pixel-diff so people, shadows, and pets don't
   trigger false alerts.
-- Alert fires **only** on spot-freed (occupied → empty). Occupied events are
-  logged + snapshotted but don't alert (per user's request).
+- Alerts text on BOTH transitions by default (`ALERT_ON_BOTH=True`); set it False
+  to fire only on spot-freed (occupied → empty). Every change is logged + snapshotted.
+- **Polling, not streaming** (per user's request, to cut WiFi bandwidth and avoid
+  H.264 corruption from lossy WiFi). Grabs one frame every `DETECT_INTERVAL_SECONDS`
+  (~15s — cars take >15s to move) instead of holding the 2K stream open 24/7. An
+  earlier version recorded ~12s video clips from a continuous stream2 buffer; that
+  was removed — snapshots only now.
 - Use **`stream1`** (full 2K) downscaled to `PROC_WIDTH`=1280 for detection.
   `stream2` (640x360) was tried first per the original plan but was too blurry —
   YOLO couldn't detect the cars at all. select_spots.py and monitor.py both
@@ -59,7 +64,7 @@ Runs entirely **locally on the user's Mac mini** — no cloud service in the loo
   shadowed SUV (Spot 1) at imgsz=1280 — yolov8n/s: ~0 (missed), yolov8m: 0.39
   (dips below threshold), **yolov8x: 0.73**. (Counterintuitively, imgsz=1920
   was *worse* for the SUV than 1280.) yolov8x runs ~136ms/frame on MPS — far
-  faster than the 2s interval needs.
+  faster than the polling interval needs.
 - Force RTSP-over-TCP (`OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp`); the
   Tapo's UDP stream drops/corrupts frames over long runs. FFmpeg's chatty SEI
   decode warnings are silenced via `OPENCV_FFMPEG_LOGLEVEL=-8`.

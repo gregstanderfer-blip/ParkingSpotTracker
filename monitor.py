@@ -1,20 +1,19 @@
 """
-monitor.py — watch parking spots and text you when one frees up.
+monitor.py — watch parking spots and text you when one changes state.
 
     python monitor.py
 
 What it does:
-  - Reads the live RTSP stream from your Tapo C120.
+  - POLLS the Tapo C120 RTSP stream every DETECT_INTERVAL_SECONDS: it grabs a
+    single frame and disconnects, rather than holding the stream open. This keeps
+    WiFi bandwidth tiny (a couple of frames every ~15s instead of a 24/7 2K feed),
+    which also avoids the stream corruption that long WiFi sessions can cause.
   - Runs a YOLO model to find vehicles (car / truck / bus / motorcycle).
-  - Decides each spot is OCCUPIED or EMPTY based on whether a vehicle
-    sits inside the polygon you drew with select_spots.py.
-  - When a spot changes state (and it holds for CONFIRM_SECONDS), it texts
-    you an iMessage via the Messages app — on a freed spot the alert includes
-    a photo of the now-empty spot. (See ALERT_ON_BOTH / ATTACH_PHOTO in config.)
-  - Every state change is logged to events.csv, saved as an annotated snapshot
-    in snapshots/, and saved as a ~CLIP_SECONDS video clip in clips/.
+  - Decides each spot is OCCUPIED or EMPTY via a point-in-polygon test.
+  - When a spot changes state (and it holds for CONFIRM_SECONDS), it texts you
+    via the Messages app and saves an annotated snapshot to snapshots/.
 
-Stop it any time with Ctrl-C.
+Stop any time with Ctrl-C.
 """
 
 import csv
@@ -22,9 +21,7 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
-from collections import deque
 from datetime import datetime
 
 import cv2
@@ -32,12 +29,9 @@ import numpy as np
 
 import config
 
-# Tapo's RTSP over UDP drops/corrupts frames during long runs; force TCP
-# (matches the `-rtsp_transport tcp` that worked in ffmpeg). Must be set before
-# cv2.VideoCapture opens the stream.
+# Use RTSP-over-TCP (more reliable than UDP) and silence FFmpeg's chatty
+# H264 decode warnings.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
-# Silence the harmless but extremely chatty "SEI type ... truncated" H264 decode
-# warnings the Tapo stream emits (FFmpeg log level -8 = quiet).
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
 try:
@@ -45,6 +39,9 @@ try:
 except ImportError:
     print("Missing dependency. Run:  pip install -r requirements.txt")
     sys.exit(1)
+
+# COCO class IDs that count as "a vehicle in the spot".
+VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 
 
 def resize_for_proc(frame):
@@ -55,145 +52,59 @@ def resize_for_proc(frame):
         return frame
     return cv2.resize(frame, (config.PROC_WIDTH, round(h * config.PROC_WIDTH / w)))
 
-# COCO class IDs that count as "a vehicle in the spot".
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 
-
-# --------------------------------------------------------------------------
-# Threaded RTSP reader: always hands back the most recent frame so we never
-# process stale, buffered video.
-# --------------------------------------------------------------------------
-class _Reader:
-    """Base: a threaded RTSP reader with tolerant reconnect."""
-    def __init__(self, url):
-        self.url = url
-        self.cap = cv2.VideoCapture(url)
-        self.lock = threading.Lock()
-        self.reconnects = 0
-        self.running = True
-
-    def _read_or_reconnect(self, fails):
-        ok, f = self.cap.read()
-        if ok:
-            return True, f, 0
-        # Tolerate brief glitches; only do a full (slow) reconnect after a run
-        # of failures — reconnecting on every dropped frame cripples the rate.
-        fails += 1
-        if fails >= 10:
-            self.reconnects += 1
-            self.cap.release()
-            time.sleep(0.5)
-            self.cap = cv2.VideoCapture(self.url)
-            return False, None, 0
-        time.sleep(0.05)
-        return False, None, fails
-
-    def stop(self):
-        # Stop the thread BEFORE releasing the capture, or release() can race
-        # with an in-flight read() and segfault.
-        self.running = False
-        if self.t.is_alive():
-            self.t.join(timeout=3)
+def _open_capture(url):
+    """Open an RTSP capture with short open/read timeouts (passed at construction,
+    where they actually take effect), so a WiFi stall fails in ~5s instead of ~30s."""
+    params = []
+    ot = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+    rt = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+    if ot is not None:
+        params += [int(ot), 8000]
+    if rt is not None:
+        params += [int(rt), 5000]
+    if params:
         try:
-            self.cap.release()
+            return cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
         except Exception:
             pass
+    return cv2.VideoCapture(url)
 
 
-class StreamReader(_Reader):
-    """Detection reader: always hands back the most recent frame so we never
-    process stale, buffered video."""
-    def __init__(self, url):
-        super().__init__(url)
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        self.frame = None
-        self.t = threading.Thread(target=self._loop, daemon=True)
-        self.t.start()
-
-    def _loop(self):
-        fails = 0
-        while self.running:
-            ok, f, fails = self._read_or_reconnect(fails)
-            if not ok:
-                continue
-            with self.lock:
-                self.frame = f
-
-    def read(self):
-        with self.lock:
-            return None if self.frame is None else self.frame.copy()
-
-
-class ClipRecorder(_Reader):
-    """Keeps a rolling buffer of recent raw frames from a (low-res) substream,
-    so a short clip ending at 'now' can be dumped on demand. Reading stream2
-    (native 640x360) means no resize/encode in the hot loop — smooth + cheap."""
-    def __init__(self, url, seconds, fps):
-        super().__init__(url)
-        self.fps = fps
-        self.buf = deque(maxlen=max(1, int(seconds * fps)))
-        self._last_t = 0.0
-        self.t = threading.Thread(target=self._loop, daemon=True)
-        self.t.start()
-
-    def _loop(self):
-        fails = 0
-        while self.running:
-            ok, f, fails = self._read_or_reconnect(fails)
-            if not ok:
-                continue
-            now = time.time()
-            if now - self._last_t >= 1.0 / self.fps:   # throttle to ~fps
-                self._last_t = now
-                with self.lock:
-                    self.buf.append((now, f))
-
-    def write_clip(self, path):
-        """Dump the buffer to an mp4 at its true (timestamp-based) fps, so
-        playback duration matches real time. Returns the path, or None."""
-        with self.lock:
-            items = list(self.buf)
-        if len(items) < 2:
+def grab_frame(url, warmup=10):
+    """Connect, read a few frames (the first decoded frame after a fresh connect
+    is keyframe-based and clean; we read a few to get the most recent one), keep
+    the last good frame, and disconnect. Returns the frame, or None if the stream
+    couldn't be read. Polling like this — instead of holding the stream open —
+    is what keeps bandwidth minimal."""
+    cap = _open_capture(url)
+    try:
+        if not cap.isOpened():
             return None
-        span = items[-1][0] - items[0][0]
-        fps = (len(items) - 1) / span if span > 0 else self.fps
-        fps = max(1.0, min(fps, 30.0))
-        h, w = items[0][1].shape[:2]
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-        for _, img in items:
-            writer.write(img)
-        writer.release()
-        return path
+        frame = None
+        for _ in range(warmup):
+            ok, f = cap.read()
+            if ok and f is not None:
+                frame = f
+        return frame
+    finally:
+        cap.release()
 
 
-def send_imessage(to, text, attachment=None):
-    """Send an iMessage (and an optional image/video) via the Messages app.
-
-    One AppleScript call: text first, then — if attaching — a short delay so
-    Messages finishes the text before the file (otherwise it drops the file),
-    with the file coerced to a POSIX file OUTSIDE the tell block.
-    """
+def send_imessage(to, text):
+    """Send an iMessage through the macOS Messages app via AppleScript."""
     safe = text.replace("\\", "\\\\").replace('"', '\\"')
-    pre, file_send = "", ""
-    if attachment:
-        ap = os.path.abspath(attachment)
-        pre = f'set theFile to POSIX file "{ap}"\n'
-        file_send = "    delay 1\n    send theFile to targetBuddy\n"
     script = (
-        f'{pre}tell application "Messages"\n'
+        'tell application "Messages"\n'
         '    set targetService to 1st account whose service type = iMessage\n'
         f'    set targetBuddy to participant "{to}" of targetService\n'
         f'    send "{safe}" to targetBuddy\n'
-        f'{file_send}'
         'end tell\n'
     )
     try:
         subprocess.run(["osascript", "-e", script], check=True,
-                       capture_output=True, timeout=30)
-        print(f"  -> alert sent to {to}" + (" (with photo)" if attachment else ""))
+                       capture_output=True, timeout=20)
+        print(f"  -> alert sent to {to}")
     except subprocess.CalledProcessError as e:
         print(f"  !! Messages send failed: {e.stderr.decode().strip()}")
     except Exception as e:
@@ -212,9 +123,9 @@ def load_spots(path):
 
 
 def box_in_spot(box, poly_np):
-    """True if the vehicle box meaningfully overlaps the spot polygon.
-    We test the box center plus its bottom-center (where the car meets
-    the ground) — robust to a car sticking up out of the polygon."""
+    """True if the vehicle box meaningfully overlaps the spot polygon. We test the
+    box center plus its bottom-center (where the car meets the ground) — robust to
+    a car sticking up out of the polygon."""
     x1, y1, x2, y2 = box
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
@@ -227,8 +138,7 @@ def box_in_spot(box, poly_np):
 
 def detect_vehicle_boxes(model, frame, device=None, conf=None, imgsz=None):
     """Run YOLO on a frame and return vehicle boxes [x1,y1,x2,y2] that clear the
-    confidence floor. Pure-ish wrapper so detection can be unit-tested on a saved
-    image. ``conf``/``imgsz`` default to the values in config."""
+    confidence floor. ``conf``/``imgsz`` default to the values in config."""
     conf = config.MIN_CONFIDENCE if conf is None else conf
     imgsz = config.PROC_WIDTH if imgsz is None else imgsz
     res = model(frame, verbose=False, imgsz=imgsz, device=device)[0]
@@ -257,23 +167,19 @@ def log_event(spot_name, new_state):
 
 
 def save_snapshot(frame, spots, spot_name, new_state):
-    os.makedirs(config.SNAPSHOT_DIR, exist_ok=True)
     img = frame.copy()
     for s in spots:
         color = (0, 0, 255) if s["occupied"] else (0, 255, 0)
         cv2.polylines(img, [s["polygon_np"]], True, color, 2)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.now()
+    # Sort snapshots into snapshots/YYYY/MM/DD/ for easy browsing.
+    day_dir = os.path.join(config.SNAPSHOT_DIR,
+                           now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
+    os.makedirs(day_dir, exist_ok=True)
     safe = spot_name.replace(" ", "_")
-    path = os.path.join(config.SNAPSHOT_DIR, f"{ts}_{safe}_{new_state}.jpg")
+    path = os.path.join(day_dir, f"{now:%H%M%S}_{safe}_{new_state}.jpg")
     cv2.imwrite(path, img)
     return path
-
-
-def clip_path(spot_name, new_state):
-    os.makedirs(config.CLIP_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = spot_name.replace(" ", "_")
-    return os.path.join(config.CLIP_DIR, f"{ts}_{safe}_{new_state}.mp4")
 
 
 def main():
@@ -289,30 +195,14 @@ def main():
     print(f"Loading model {config.MODEL} (downloads on first run)...")
     model = YOLO(config.MODEL)
 
-    # Use the Apple GPU (MPS) if available, else CPU.
     try:
         import torch
         device = "mps" if torch.backends.mps.is_available() else "cpu"
     except Exception:
         device = "cpu"
     print(f"Running detection on: {device}")
-
-    print("Connecting to camera...")
-    reader = StreamReader(config.RTSP_URL)
-    # Separate low-res reader that keeps a rolling buffer for clip recording.
-    recorder = (ClipRecorder(config.CLIP_RTSP_URL, config.CLIP_SECONDS, config.CLIP_FPS)
-                if config.SAVE_CLIPS else None)
-    # wait for first frame
-    t0 = time.time()
-    while reader.read() is None:
-        if time.time() - t0 > 20:
-            print("ERROR: no frames from the stream. Check RTSP_URL in config.py.")
-            reader.stop()
-            if recorder:
-                recorder.stop()
-            sys.exit(1)
-        time.sleep(0.5)
-    print("Connected. Watching... (Ctrl-C to stop)\n")
+    print(f"Polling every {config.DETECT_INTERVAL_SECONDS:g}s "
+          f"(one frame per check — no continuous streaming).")
 
     # Per-spot state machine.
     for s in spots:
@@ -320,75 +210,63 @@ def main():
         s["candidate"] = None         # state we're waiting to confirm
         s["candidate_since"] = 0.0
 
+    print("Watching... (Ctrl-C to stop)\n")
+    misses = 0
     try:
         while True:
-            frame = reader.read()
+            frame = grab_frame(config.RTSP_URL)
             if frame is None:
-                time.sleep(0.5)
+                # Couldn't get a frame (WiFi/stream issue). Hold state, no alert.
+                misses += 1
+                if misses == 1 or misses % 10 == 0:
+                    print(f"{datetime.now():%H:%M:%S}  no frame "
+                          f"(stream/WiFi issue) — holding state  [{misses}]")
+                time.sleep(config.DETECT_INTERVAL_SECONDS)
                 continue
-            frame = resize_for_proc(frame)
+            if misses:
+                print(f"{datetime.now():%H:%M:%S}  stream recovered")
+                misses = 0
 
-            boxes = detect_vehicle_boxes(model, frame, device=device)
-            occ = spot_occupancy(boxes, spots)
+            frame = resize_for_proc(frame)
+            occ = spot_occupancy(detect_vehicle_boxes(model, frame, device=device), spots)
 
             now = time.time()
             for s in spots:
                 raw = occ[s["name"]]
 
-                # confirm-with-hysteresis
+                # confirm-with-hysteresis: a change must persist CONFIRM_SECONDS.
                 if s["candidate"] != raw:
                     s["candidate"] = raw
                     s["candidate_since"] = now
-
-                confirmed_long_enough = (
-                    now - s["candidate_since"] >= config.CONFIRM_SECONDS
-                )
+                confirmed = now - s["candidate_since"] >= config.CONFIRM_SECONDS
 
                 if s["occupied"] is None:
-                    # first reading: accept immediately, no alert
-                    if confirmed_long_enough or s["occupied"] is None:
-                        s["occupied"] = raw
-                        state = "occupied" if raw else "empty"
-                        print(f"{datetime.now():%H:%M:%S}  {s['name']}: initial = {state}")
-                        log_event(s["name"], state)
+                    # First reading: accept immediately, no alert.
+                    s["occupied"] = raw
+                    state = "occupied" if raw else "empty"
+                    print(f"{datetime.now():%H:%M:%S}  {s['name']}: initial = {state}")
+                    log_event(s["name"], state)
                     continue
 
-                if raw != s["occupied"] and confirmed_long_enough:
+                if raw != s["occupied"] and confirmed:
                     s["occupied"] = raw
                     state = "occupied" if raw else "empty"
                     stamp = f"{datetime.now():%H:%M:%S}"
                     print(f"{stamp}  {s['name']}: -> {state.upper()}")
                     log_event(s["name"], state)
-
-                    snap_path = None
                     if config.SAVE_SNAPSHOTS:
-                        snap_path = save_snapshot(frame, spots, s["name"], state)
-                    if recorder is not None:
-                        try:
-                            cp = recorder.write_clip(clip_path(s["name"], state))
-                            if cp:
-                                print(f"  -> saved clip {cp}")
-                        except Exception as e:
-                            print(f"  !! clip save failed: {e}")
-
+                        save_snapshot(frame, spots, s["name"], state)
                     # Text on a freed spot always; on a newly-occupied spot only
-                    # if ALERT_ON_BOTH. Attach the snapshot photo when enabled.
+                    # if ALERT_ON_BOTH.
                     if (not raw) or config.ALERT_ON_BOTH:
-                        if not raw:
-                            text = f"🅿️ {s['name']} just opened up! ({stamp})"
-                        else:
-                            text = f"🚗 {s['name']} is now occupied. ({stamp})"
-                        attach = snap_path if config.ATTACH_PHOTO else None
-                        send_imessage(config.IMESSAGE_TO, text, attach)
+                        text = (f"🅿️ {s['name']} just opened up! ({stamp})" if not raw
+                                else f"🚗 {s['name']} is now occupied. ({stamp})")
+                        send_imessage(config.IMESSAGE_TO, text)
 
             time.sleep(config.DETECT_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
         print("\nStopping.")
-    finally:
-        reader.stop()
-        if recorder is not None:
-            recorder.stop()
 
 
 if __name__ == "__main__":
