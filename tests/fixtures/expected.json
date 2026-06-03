@@ -14,5 +14,21 @@
       "Spot 1": true,
       "Spot 2": true
     }
+  },
+  {
+    "label": "morning",
+    "image": "morning.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": true
+    }
+  },
+  {
+    "label": "night_empty",
+    "image": "night_empty.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": false
+    }
   }
 ]
