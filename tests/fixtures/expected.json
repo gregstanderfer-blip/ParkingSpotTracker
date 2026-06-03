@@ -6,5 +6,13 @@
       "Spot 1": true,
       "Spot 2": true
     }
+  },
+  {
+    "label": "night",
+    "image": "night.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": true
+    }
   }
 ]
