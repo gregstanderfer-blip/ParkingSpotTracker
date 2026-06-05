@@ -22,14 +22,15 @@ RTSP_URL = "rtsp://USERNAME:PASSWORD@192.168.1.42:554/stream1"
 IMESSAGE_TO = "+15551234567"
 
 # ---- Detection tuning ----------------------------------------------------
-CONFIRM_SECONDS = 30           # a new state must hold this long before it counts
-                               # (also rides out brief low-light detection dips)
+CONFIRM_SECONDS = 90           # a new state must hold this long before it counts;
+                               # long enough (~6 polls) to ride out brief dips when
+                               # a dark car is in shade
 DETECT_INTERVAL_SECONDS = 15   # how often to poll (grab one frame + detect). Also
                                # sets how little WiFi bandwidth is used. Cars take
                                # >15s to move, so ~15s is plenty.
-MIN_CONFIDENCE = 0.25          # min YOLO confidence to count a vehicle (a bit low,
-                               # so a dark/shadowed car isn't lost as it gets dim;
-                               # CONFIRM_SECONDS re-checks before committing)
+MIN_CONFIDENCE = 0.20          # min YOLO confidence to count a vehicle (low, so a
+                               # dark/shadowed car isn't lost; CONFIRM_SECONDS is
+                               # the main guard against the remaining dips)
 MODEL = "yolov8x.pt"           # downloads on first run; see README for why "x"
 PROC_WIDTH = 1280              # detection/calibration width (must match between
                                # select_spots.py and monitor.py)

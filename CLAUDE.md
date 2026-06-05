@@ -100,14 +100,16 @@ display (not over a headless/remote shell).
       (use `caffeinate -i` so the Mac doesn't sleep while monitoring).
 
 ## Tuning knobs (config.py)
-- `CONFIRM_SECONDS` — higher = fewer false alerts, slower to fire (currently 30,
-  raised from 8 to ride out low-light confidence dips on the dark Spot 1 car).
-- `DETECT_INTERVAL_SECONDS` — higher = lighter CPU (currently 2).
+- `CONFIRM_SECONDS` — higher = fewer false alerts, slower to fire (currently 90).
+  The dark Spot 1 SUV in afternoon overhang shade hovers right at the threshold
+  and blips below it for a poll or two; a ~6-poll window rides those out. (Was 30,
+  which let occasional 2-poll blips through → false "empty" alerts.)
+- `DETECT_INTERVAL_SECONDS` — poll cadence (currently 15).
 - `MIN_CONFIDENCE` — raise if it sees phantom cars, lower if it misses them
-  (currently 0.25: the shadowed SUV dips to ~0.29 at dusk; 0.25 keeps it detected
-  with headroom vs noise, and the long CONFIRM_SECONDS — ~15 re-checks — is the
-  real guard against committing on a brief dip, so the threshold needn't go very
-  low). NOTE: brightening / CLAHE was tested and made the dark car HARDER to detect.
+  (currently 0.20: the shadowed SUV scores ~0.32-0.41 but dips toward the floor;
+  0.20 keeps it detected on more frames, and empty spots still read empty — see
+  the night_empty fixture). NOTE: brightening / CLAHE made the dark car WORSE.
+  Root fix for the shade is camera-side WDR/HDR or more light, not software.
 - `MODEL` — yolov8x.pt; smaller models miss the shadowed SUV here.
 - `PROC_WIDTH` — detection/calibration width (1280). Changing it means re-running
   `select_spots.py`, since saved polygon coordinates are in this resolution.
