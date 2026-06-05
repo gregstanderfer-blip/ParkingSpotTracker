@@ -30,5 +30,21 @@
       "Spot 1": true,
       "Spot 2": false
     }
+  },
+  {
+    "label": "afternoon_empty",
+    "image": "afternoon_empty.jpg",
+    "spots": {
+      "Spot 1": false,
+      "Spot 2": false
+    }
+  },
+  {
+    "label": "afternoon_spot1_empty",
+    "image": "afternoon_spot1_empty.jpg",
+    "spots": {
+      "Spot 1": false,
+      "Spot 2": true
+    }
   }
 ]
