@@ -195,11 +195,12 @@ def main():
     print(f"Loading model {config.MODEL} (downloads on first run)...")
     model = YOLO(config.MODEL)
 
-    try:
-        import torch
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-    except Exception:
-        device = "cpu"
+    # Run detection on CPU, not MPS (Apple GPU). MPS was ~80ms faster but produced
+    # intermittent WRONG results in long-running (multi-hour) sessions: a clearly
+    # visible car would read as undetected for a stretch, firing false "empty"
+    # alerts — while the very same frame detected correctly in a fresh process / on
+    # CPU. At one poll per 15s, CPU's ~210ms is irrelevant, and it's stable.
+    device = "cpu"
     print(f"Running detection on: {device}")
     print(f"Polling every {config.DETECT_INTERVAL_SECONDS:g}s "
           f"(one frame per check — no continuous streaming).")
@@ -223,7 +224,8 @@ def main():
                           f"(stream/WiFi issue) — holding state  [{misses}]")
                 time.sleep(config.DETECT_INTERVAL_SECONDS)
                 continue
-            if misses:
+            recovered = misses > 0
+            if recovered:
                 print(f"{datetime.now():%H:%M:%S}  stream recovered")
                 misses = 0
 
@@ -231,6 +233,17 @@ def main():
             occ = spot_occupancy(detect_vehicle_boxes(model, frame, device=device), spots)
 
             now = time.time()
+            # After a stream gap, re-confirm from scratch: the stall (and the noisy
+            # frames around it) shouldn't let pre-gap readings push a state change
+            # over the line the instant frames come back. Snap each spot's candidate
+            # back to its committed state so a real change must persist a fresh
+            # CONFIRM_SECONDS after recovery.
+            if recovered:
+                for s in spots:
+                    if s["occupied"] is not None:
+                        s["candidate"] = s["occupied"]
+                        s["candidate_since"] = now
+
             for s in spots:
                 raw = occ[s["name"]]
 
