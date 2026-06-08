@@ -46,5 +46,21 @@
       "Spot 1": false,
       "Spot 2": true
     }
+  },
+  {
+    "label": "morning_both_full",
+    "image": "morning_both_full.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": true
+    }
+  },
+  {
+    "label": "morning_both_full_2",
+    "image": "morning_both_full_2.jpg",
+    "spots": {
+      "Spot 1": true,
+      "Spot 2": true
+    }
   }
 ]
